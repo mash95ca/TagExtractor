@@ -1,0 +1,178 @@
+import os
+import sys
+import pandas as pd
+import time
+import psutil
+import hashlib
+from datetime import datetime
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+from openpyxl.styles import Font
+from zipfile import BadZipFile
+from openpyxl.utils.dataframe import dataframe_to_rows
+from openpyxl.worksheet.worksheet import Worksheet
+from openpyxl.utils.cell import coordinate_from_string
+
+TAG_TYPES = {
+    "#QUERY": "Query",
+    "#ACTION": "Action",
+    "#RECOMMENDATION": "Recommendation",
+    "#ISSUE": "Issue",
+    "#RISK": "Risk",
+    "#TEST": "Test step",
+    "#FINDING": "Finding"
+}
+
+def get_folder_from_user():
+    folder = input("📂 Enter the full path to the MAIN audit folder: ").strip()
+    if not os.path.isdir(folder):
+        raise ValueError("Invalid folder path. Please check the path and try again.")
+    return folder
+
+def extract_tags_from_excel(file_path):
+    entries = []
+    try:
+        wb = load_workbook(filename=file_path, read_only=True, data_only=True)
+        for sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+            for row in ws.iter_rows():
+                for cell in row:
+                    val = cell.value
+                    if isinstance(val, str):
+                        val_upper = val.upper()
+                        for tag, tag_type in TAG_TYPES.items():
+                            if tag in val_upper:
+                                cell_address = f"{get_column_letter(cell.column)}{cell.row}"
+                                unique_string = f"{file_path}|{sheet_name}|{cell_address}|{val.strip()}|{tag_type}"
+                                tag_id = hashlib.sha1(unique_string.encode('utf-8')).hexdigest()
+                                entries.append({
+                                    "Tag ID": tag_id,
+                                    "Full Path": file_path,
+                                    "File": os.path.basename(file_path),
+                                    "Sheet": sheet_name,
+                                    "Cell Address": cell_address,
+                                    "Tag Type": tag_type,
+                                    "Tag Text": val.strip(),
+                                    "Status": "Open"
+                                })
+        wb.close()
+    except (PermissionError, BadZipFile, OSError, KeyError) as e:
+        print(f"\n⚠️ Skipped: {file_path} — {e}")
+    except Exception as e:
+        print(f"\n❌ Error reading {file_path}: {e}")
+    return entries
+
+
+def scan_excel_files(base_folder):
+    all_files = [
+        os.path.join(root, file)
+        for root, _, files in os.walk(base_folder)
+        for file in files
+        if file.lower().endswith((".xlsx", ".xlsm")) and not file.startswith("~$")
+    ]
+
+    total = len(all_files)
+    print(f"📁 Found {total} Excel files to scan.")
+
+    all_entries = []
+    start_time = time.time()
+    process = psutil.Process(os.getpid())
+
+    for idx, file_path in enumerate(all_files, start=1):
+        short_name = file_path[-60:] if len(file_path) > 60 else os.path.basename(file_path)
+        sys.stdout.write(f"\r🔍 Scanning {idx}/{total}: {short_name.ljust(70)}")
+        sys.stdout.flush()
+
+        entries = extract_tags_from_excel(file_path)
+        if entries:
+            all_entries.extend(entries)
+
+    elapsed = time.time() - start_time
+    mem_usage_mb = process.memory_info().rss / (1024 * 1024)
+
+    print(f"\n\n✅ Scan complete!")
+    print(f"⏱ Time taken: {elapsed:.2f} seconds")
+    print(f"🧠 Memory used: {mem_usage_mb:.2f} MB")
+
+    return all_entries
+
+def export_to_excel(entries, output_path):
+    new_df = pd.DataFrame(entries)
+
+    if not os.path.exists(output_path):
+        with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+            new_df.to_excel(writer, index=False, sheet_name="Audit Tags")
+        return
+
+    wb = load_workbook(output_path)
+    if "Audit Tags" in wb.sheetnames:
+        ws: Worksheet = wb["Audit Tags"]
+        existing_data = ws.iter_rows(values_only=True)
+        headers = next(existing_data, None)
+        existing_df = pd.DataFrame(existing_data, columns=headers) if headers else pd.DataFrame()
+    else:
+        ws = wb.create_sheet("Audit Tags")
+        existing_df = pd.DataFrame()
+
+    merge_keys = ["Tag ID"]
+    new_df["Tag ID"] = new_df["Tag ID"].astype(str)
+
+    if not existing_df.empty:
+        existing_df["Tag ID"] = existing_df["Tag ID"].astype(str)
+        merged = pd.merge(new_df, existing_df[merge_keys], on=merge_keys, how='left', indicator=True)
+        filtered_new = merged[merged['_merge'] == 'left_only'].drop(columns=['_merge'])
+        combined_df = pd.concat([existing_df, filtered_new], ignore_index=True)
+    else:
+        combined_df = new_df
+
+    # Recreate the worksheet cleanly
+    if "Audit Tags" in wb.sheetnames:
+        wb.remove(wb["Audit Tags"])
+    ws = wb.create_sheet("Audit Tags")
+
+    # Define column order with Tag ID included
+    combined_df = combined_df[[
+    "Tag ID", "File", "Full Path", "Sheet", "Cell Address",
+    "Excel Link", "Tag Type", "Tag Text", "Status"
+    ]]
+
+    combined_df.sort_values(by=["Tag Type", "File", "Sheet"], inplace=True)
+
+    # Write DataFrame to worksheet
+    for r_idx, row in enumerate(dataframe_to_rows(combined_df, index=False, header=True), 1):
+        for c_idx, value in enumerate(row, 1):
+            cell = ws.cell(row=r_idx, column=c_idx, value=value)
+            if r_idx == 1:
+                cell.font = Font(bold=True)
+
+    # Insert Excel references into the Cell Address column (4th column)
+    combined_df["Excel Link"] = ""
+
+    for idx, row in combined_df.iterrows():
+        try:
+            cell_col, cell_row = coordinate_from_string(row["Cell Address"])
+            absolute_cell = f"${cell_col}${cell_row}"
+            file_name = os.path.basename(row["Full Path"])
+            sheet_name = row["Sheet"].replace("'", "''")
+            excel_reference = f"='[{file_name}]{sheet_name}'!{absolute_cell}"
+            combined_df.at[idx, "Excel Link"] = excel_reference
+        except Exception as e:
+            print(f"⚠️ Failed to generate Excel reference for row {idx}: {e}")
+
+    wb.save(output_path)
+    wb.close()
+
+
+def main():
+    try:
+        folder = get_folder_from_user()
+        results = scan_excel_files(folder)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_filename_with_time = f"Audit_Tag_Tracker_{timestamp}.xlsx"
+        output_path = os.path.join(folder, output_filename_with_time)
+        export_to_excel(results, output_path)
+    except Exception as e:
+        print(f"\n❌ Critical Error: {e}")
+
+if __name__ == "__main__":
+    main()
